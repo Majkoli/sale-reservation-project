@@ -6,6 +6,8 @@ import com.flashsale.reservation.domain.OrderStatus;
 import com.flashsale.reservation.domain.Reservation;
 import com.flashsale.reservation.domain.ReservationStatus;
 import com.flashsale.reservation.domain.WalletAccount;
+import com.flashsale.reservation.dto.CancelRequest;
+import com.flashsale.reservation.dto.CancelResponse;
 import com.flashsale.reservation.dto.CheckoutRequest;
 import com.flashsale.reservation.dto.CheckoutResponse;
 import com.flashsale.reservation.dto.HoldRequest;
@@ -145,6 +147,35 @@ public class CheckoutService {
                 .status(savedOrder.getStatus().name())
                 .totalDeductedMinor(totalCost)
                 .currency(savedOrder.getCurrency())
+                .build();
+    }
+
+    /**
+     * Proactively cancels a held reservation and restores the Redis stock hold immediately.
+     */
+    @Transactional
+    public CancelResponse cancelReservation(CancelRequest request) {
+        Reservation reservation = reservationRepository.findById(request.getReservationId())
+                .orElseThrow(() -> new ResourceNotFoundException("Reservation not found: " + request.getReservationId()));
+
+        if (!reservation.getUserId().equals(request.getUserId())) {
+            throw new InvalidReservationStateException("Reservation does not belong to user: " + request.getUserId());
+        }
+
+        if (reservation.getStatus() != ReservationStatus.HELD) {
+            throw new InvalidReservationStateException("Only HELD reservations can be cancelled. Current status: " + reservation.getStatus());
+        }
+
+        reservation.setStatus(ReservationStatus.CANCELLED);
+        reservationRepository.save(reservation);
+
+        redisReservationService.releaseStockHold(reservation.getSku(), reservation.getId(), reservation.getQuantity());
+        log.info("Reservation cancelled: {}, refunded {} to SKU {}",
+                reservation.getId(), reservation.getQuantity(), reservation.getSku());
+
+        return CancelResponse.builder()
+                .reservationId(reservation.getId())
+                .status(reservation.getStatus().name())
                 .build();
     }
 }

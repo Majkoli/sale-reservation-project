@@ -1,5 +1,7 @@
 package com.flashsale.reservation.controller;
 
+import com.flashsale.reservation.dto.CancelRequest;
+import com.flashsale.reservation.dto.CancelResponse;
 import com.flashsale.reservation.dto.CheckoutRequest;
 import com.flashsale.reservation.dto.CheckoutResponse;
 import com.flashsale.reservation.dto.HoldRequest;
@@ -30,6 +32,12 @@ public class FlashSaleController {
     @PostMapping("/checkout")
     public ResponseEntity<CheckoutResponse> checkout(@Valid @RequestBody CheckoutRequest request) {
         CheckoutResponse response = checkoutService.checkout(request);
+        return ResponseEntity.ok(response);
+    }
+
+    @PostMapping("/cancel")
+    public ResponseEntity<CancelResponse> cancel(@Valid @RequestBody CancelRequest request) {
+        CancelResponse response = checkoutService.cancelReservation(request);
         return ResponseEntity.ok(response);
     }
 }
