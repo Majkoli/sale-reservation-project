@@ -1,8 +1,11 @@
 package com.flashsale.reservation;
 
 import com.flashsale.reservation.domain.InventoryItem;
+import com.flashsale.reservation.domain.Reservation;
 import com.flashsale.reservation.domain.ReservationStatus;
 import com.flashsale.reservation.domain.WalletAccount;
+import com.flashsale.reservation.dto.CheckoutRequest;
+import com.flashsale.reservation.dto.CheckoutResponse;
 import com.flashsale.reservation.dto.HoldRequest;
 import com.flashsale.reservation.dto.HoldResponse;
 import com.flashsale.reservation.repository.InventoryItemRepository;
@@ -10,6 +13,7 @@ import com.flashsale.reservation.repository.OrderRepository;
 import com.flashsale.reservation.repository.ReservationRepository;
 import com.flashsale.reservation.repository.WalletAccountRepository;
 import com.flashsale.reservation.service.RedisReservationService;
+import com.flashsale.reservation.worker.ReservationReconciliationWorker;
 import com.redis.testcontainers.RedisContainer;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -27,8 +31,10 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -87,6 +93,9 @@ class FlashSaleConcurrencyIntegrationTest {
 
     @Autowired
     private RedisReservationService redisReservationService;
+
+    @Autowired
+    private ReservationReconciliationWorker reconciliationWorker;
 
     @Autowired
     private RedisTemplate<String, String> redisTemplate;
@@ -178,5 +187,113 @@ class FlashSaleConcurrencyIntegrationTest {
         assertThat(conflictCount.get()).isEqualTo(40);
         assertThat(redisReservationService.getStock(FLASH_TICKET_SKU)).isEqualTo(0);
         assertThat(reservationRepository.countByStatus(ReservationStatus.HELD)).isEqualTo(10L);
+    }
+
+    @Test
+    @DisplayName("Scenario 2: Double-Spending Prevention on Wallet - concurrent checkouts on 50,000 öre wallet allow only one")
+    void scenario2_doubleSpendingPreventionOnWallet() throws Exception {
+        String userId = "double-spend-user";
+        walletAccountRepository.save(WalletAccount.builder()
+                .userId(userId)
+                .balanceMinor(50_000L)
+                .currency("SEK")
+                .build());
+
+        inventoryItemRepository.save(InventoryItem.builder()
+                .sku("FLASH-HEADPHONES")
+                .name("Wireless Noise-Cancelling Headphones")
+                .totalStock(5)
+                .availableStock(5)
+                .priceMinor(50_000L)
+                .build());
+        redisReservationService.setStock("FLASH-HEADPHONES", 5);
+
+        HoldResponse hold1 = restTemplate.postForEntity(
+                "/api/v1/sales/reserve",
+                HoldRequest.builder().sku(FLASH_TICKET_SKU).userId(userId).quantity(1).build(),
+                HoldResponse.class
+        ).getBody();
+
+        HoldResponse hold2 = restTemplate.postForEntity(
+                "/api/v1/sales/reserve",
+                HoldRequest.builder().sku("FLASH-HEADPHONES").userId(userId).quantity(1).build(),
+                HoldResponse.class
+        ).getBody();
+
+        assertThat(hold1).isNotNull();
+        assertThat(hold2).isNotNull();
+
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        CountDownLatch readyLatch = new CountDownLatch(2);
+        CountDownLatch startGun = new CountDownLatch(1);
+
+        List<UUID> reservationIds = List.of(hold1.getReservationId(), hold2.getReservationId());
+        List<Future<ResponseEntity<CheckoutResponse>>> futures = new ArrayList<>();
+
+        for (UUID reservationId : reservationIds) {
+            futures.add(executor.submit(() -> {
+                readyLatch.countDown();
+                startGun.await(5, TimeUnit.SECONDS);
+                return restTemplate.postForEntity(
+                        "/api/v1/sales/checkout",
+                        CheckoutRequest.builder().reservationId(reservationId).userId(userId).build(),
+                        CheckoutResponse.class
+                );
+            }));
+        }
+
+        assertThat(readyLatch.await(5, TimeUnit.SECONDS)).isTrue();
+        startGun.countDown();
+
+        int okCount = 0;
+        int badRequestCount = 0;
+
+        for (Future<ResponseEntity<CheckoutResponse>> future : futures) {
+            ResponseEntity<CheckoutResponse> response = future.get(10, TimeUnit.SECONDS);
+            if (response.getStatusCode() == HttpStatus.OK) {
+                okCount++;
+                assertThat(response.getBody()).isNotNull();
+                assertThat(response.getBody().getOrderId()).isNotNull();
+                assertThat(response.getBody().getTotalDeductedMinor()).isEqualTo(50_000L);
+            } else if (response.getStatusCode() == HttpStatus.BAD_REQUEST) {
+                badRequestCount++;
+            }
+        }
+
+        executor.shutdown();
+        assertThat(executor.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
+
+        assertThat(okCount).isEqualTo(1);
+        assertThat(badRequestCount).isEqualTo(1);
+        assertThat(orderRepository.count()).isEqualTo(1L);
+
+        WalletAccount updatedWallet = walletAccountRepository.findByUserId(userId).orElseThrow();
+        assertThat(updatedWallet.getBalanceMinor()).isEqualTo(0L);
+    }
+
+    @Test
+    @DisplayName("Scenario 3: Automated Expiration & Reclamation - expired HELD reservation restores Redis stock and transitions to EXPIRED")
+    void scenario3_automatedExpirationAndReclamation() {
+        int reservedQty = 3;
+        redisReservationService.setStock(FLASH_TICKET_SKU, INITIAL_STOCK - reservedQty);
+
+        UUID expiredReservationId = UUID.randomUUID();
+        Reservation expiredReservation = Reservation.builder()
+                .id(expiredReservationId)
+                .userId("user-1")
+                .sku(FLASH_TICKET_SKU)
+                .quantity(reservedQty)
+                .status(ReservationStatus.HELD)
+                .expiresAt(Instant.now().minusSeconds(5))
+                .build();
+        reservationRepository.save(expiredReservation);
+
+        int reconciled = reconciliationWorker.reconcileExpiredReservations();
+
+        assertThat(reconciled).isEqualTo(1);
+        assertThat(redisReservationService.getStock(FLASH_TICKET_SKU)).isEqualTo(INITIAL_STOCK);
+
+        Reservation reloaded = reservationRepository.findById(expiredReservationId).orElseThrow();
+        assertThat(reloaded.getStatus()).isEqualTo(ReservationStatus.EXPIRED);
     }
 }
