@@ -76,3 +76,54 @@ The engine combines both locking strategies across the domain model based on con
 | :--- | :--- | :--- | :--- |
 | **Pessimistic Write Lock** | `WalletAccountRepository.findByUserIdForUpdate` & `InventoryItemRepository.findBySkuForUpdate` during `/checkout` | `SELECT ... FOR UPDATE` (`@Lock(LockModeType.PESSIMISTIC_WRITE)`) | Serializes concurrent checkout attempts for the same wallet at the database row level. The second concurrent thread blocks until the first commits, then immediately observes the updated `0` balance and deterministically throws `InsufficientFundsException` (`400 Bad Request`) instead of failing with a generic optimistic retry exception. |
 | **Optimistic Locking** | `@Version` column on `InventoryItem` and `WalletAccount` entities | `UPDATE ... SET version = version + 1 WHERE id = ? AND version = ?` | Acts as a defense-in-depth invariant guard for non-locking administrative updates, preventing lost updates if two transactions ever modify an entity outside a pessimistic lock boundary. |
+
+---
+
+## 3. Performance & Chaos Test Results
+
+The concurrency integration test suite ([`FlashSaleConcurrencyIntegrationTest`](src/test/java/com/flashsale/reservation/FlashSaleConcurrencyIntegrationTest.java)) spins up ephemeral **PostgreSQL 16** and **Redis 7.2** containers via **Testcontainers** and synchronizes worker threads using `CountDownLatch` barriers to fire requests at the exact same millisecond.
+
+| Scenario | Concurrency Profile | Initial State | Expected Invariant | Verified Result |
+| :--- | :--- | :--- | :--- | :--- |
+| **1. The Stampede (Oversell Prevention)** | `50` parallel worker threads released simultaneously via `CountDownLatch` | `10` units of `FLASH-TICKET` (`50,000` öre each); `50` wallets (`100,000` öre each) | Exactly `10` holds succeed (`201 Created`); `40` rejected (`409 Conflict`); `0` oversells | **`10` `201 Created`, `40` `409 Conflict`, Redis `stock:FLASH-TICKET = 0`, `10` `HELD` rows in PostgreSQL** |
+| **2. Wallet Double-Spend Attack** | `2` parallel checkout threads for the same user released simultaneously | `1` wallet with `50,000` öre (`500.00 SEK`); `2` valid `HELD` reservations costing `50,000` öre each | Exactly `1` order settled (`200 OK`); `1` rejected (`400 Bad Request` / `InsufficientFundsException`); no negative balance | **`1` `PAID` order created, `1` `400 Bad Request`, final wallet balance = `0` öre (`0` balance leaks)** |
+| **3. Automated Expiration & Reclamation** | Scheduled reconciliation sweep (`ReservationReconciliationWorker`) | `HELD` reservation of `3` units with `expires_at = now - 5s`, Redis stock at `7` | Status transitions to `EXPIRED` in isolated transaction; `3` units refunded to Redis | **Database status = `EXPIRED`, Redis `stock:FLASH-TICKET` restored from `7` to `10`** |
+
+---
+
+## 4. API Reference
+
+| Method | Endpoint | Description | Success Status | Error Statuses |
+| :--- | :--- | :--- | :--- | :--- |
+| `POST` | `/api/v1/sales/reserve` | Atomically holds stock in Redis (`600s` TTL) and persists a `HELD` reservation | `201 Created` | `409 Conflict` (Out of stock), `404 Not Found` |
+| `POST` | `/api/v1/sales/checkout` | Settles a `HELD` reservation inside an ACID transaction (`SELECT FOR UPDATE`) | `200 OK` | `400 Bad Request` (Insufficient funds / expired), `404 Not Found` |
+| `POST` | `/api/v1/sales/cancel` | Proactively cancels a `HELD` reservation and immediately refunds Redis stock | `200 OK` | `400 Bad Request`, `404 Not Found` |
+
+---
+
+## 5. Setup & Verification
+
+### Prerequisites
+- **Java 21** (Temurin / OpenJDK 21+)
+- **Docker & Docker Compose** (for local PostgreSQL 16, Redis 7.2, and Testcontainers)
+
+### 1. Start Local Infrastructure
+Launch PostgreSQL 16 (`port 5432`, database `flashsale_db`) and Redis 7.2 (`port 6379`):
+
+```bash
+docker compose up -d
+```
+
+### 2. Run the Application
+Flyway automatically applies [`V1__init_flash_sale_schema.sql`](src/main/resources/db/migration/V1__init_flash_sale_schema.sql) on startup:
+
+```bash
+./mvnw spring-boot:run
+```
+
+### 3. Run Unit & Concurrency Integration Tests
+Execute the full test suite (unit tests + Testcontainers multi-threaded chaos tests):
+
+```bash
+./mvnw verify
+```
