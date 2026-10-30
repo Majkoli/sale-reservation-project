@@ -115,6 +115,33 @@ class CheckoutServiceUnitTest {
     }
 
     @Test
+    void reserveItem_whenDatabaseSaveFails_releasesRedisStockHoldAndRethrows() {
+        InventoryItem item = InventoryItem.builder()
+                .id(UUID.randomUUID())
+                .sku("FLASH-TICKET")
+                .name("VIP Ticket")
+                .totalStock(10)
+                .availableStock(10)
+                .priceMinor(50_000L)
+                .build();
+
+        when(inventoryItemRepository.findBySku("FLASH-TICKET")).thenReturn(Optional.of(item));
+        when(redisReservationService.acquireStockHold(eq("FLASH-TICKET"), eq("user-1"), any(UUID.class), eq(2)))
+                .thenReturn(true);
+        when(reservationRepository.save(any(Reservation.class)))
+                .thenThrow(new RuntimeException("Database connection lost"));
+
+        assertThatThrownBy(() -> checkoutService.reserveItem(HoldRequest.builder()
+                .sku("FLASH-TICKET")
+                .userId("user-1")
+                .quantity(2)
+                .build()))
+                .isInstanceOf(RuntimeException.class);
+
+        verify(redisReservationService).releaseStockHold(eq("FLASH-TICKET"), any(UUID.class), eq(2));
+    }
+
+    @Test
     void checkout_whenSufficientBalance_deductsWalletAndStockAndCreatesPaidOrder() {
         UUID reservationId = UUID.randomUUID();
         Reservation reservation = Reservation.builder()
@@ -142,7 +169,7 @@ class CheckoutServiceUnitTest {
                 .priceMinor(50_000L)
                 .build();
 
-        when(reservationRepository.findById(reservationId)).thenReturn(Optional.of(reservation));
+        when(reservationRepository.findByIdForUpdate(reservationId)).thenReturn(Optional.of(reservation));
         when(walletAccountRepository.findByUserIdForUpdate("user-1")).thenReturn(Optional.of(wallet));
         when(inventoryItemRepository.findBySkuForUpdate("FLASH-TICKET")).thenReturn(Optional.of(item));
         when(orderRepository.save(any(Order.class))).thenAnswer(inv -> {
@@ -192,7 +219,7 @@ class CheckoutServiceUnitTest {
                 .priceMinor(50_000L)
                 .build();
 
-        when(reservationRepository.findById(reservationId)).thenReturn(Optional.of(reservation));
+        when(reservationRepository.findByIdForUpdate(reservationId)).thenReturn(Optional.of(reservation));
         when(walletAccountRepository.findByUserIdForUpdate("user-1")).thenReturn(Optional.of(wallet));
         when(inventoryItemRepository.findBySkuForUpdate("FLASH-TICKET")).thenReturn(Optional.of(item));
 
@@ -215,7 +242,7 @@ class CheckoutServiceUnitTest {
                 .expiresAt(Instant.now().plusSeconds(300))
                 .build();
 
-        when(reservationRepository.findById(reservationId)).thenReturn(Optional.of(reservation));
+        when(reservationRepository.findByIdForUpdate(reservationId)).thenReturn(Optional.of(reservation));
 
         CancelResponse response = checkoutService.cancelReservation(CancelRequest.builder()
                 .reservationId(reservationId)

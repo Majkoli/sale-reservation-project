@@ -45,6 +45,7 @@ public class CheckoutService {
 
     /**
      * Executes atomic Redis Lua hold and persists a HELD Reservation in PostgreSQL.
+     * Compensates Redis hold immediately if database persistence fails.
      */
     @Transactional
     public HoldResponse reserveItem(HoldRequest request) {
@@ -75,7 +76,12 @@ public class CheckoutService {
                 .expiresAt(expiresAt)
                 .build();
 
-        reservationRepository.save(reservation);
+        try {
+            reservationRepository.save(reservation);
+        } catch (RuntimeException ex) {
+            redisReservationService.releaseStockHold(item.getSku(), reservationId, request.getQuantity());
+            throw ex;
+        }
 
         return HoldResponse.builder()
                 .reservationId(reservationId)
@@ -86,11 +92,12 @@ public class CheckoutService {
     }
 
     /**
-     * Settles a held reservation inside an ACID transaction using pessimistic wallet locking.
+     * Settles a held reservation inside an ACID transaction using pessimistic locking.
      */
     @Transactional
     public CheckoutResponse checkout(CheckoutRequest request) {
-        Reservation reservation = reservationRepository.findById(request.getReservationId())
+        Reservation reservation = reservationRepository.findByIdForUpdate(request.getReservationId())
+                .or(() -> reservationRepository.findById(request.getReservationId()))
                 .orElseThrow(() -> new ResourceNotFoundException("Reservation not found: " + request.getReservationId()));
 
         if (!reservation.getUserId().equals(request.getUserId())) {
@@ -155,7 +162,8 @@ public class CheckoutService {
      */
     @Transactional
     public CancelResponse cancelReservation(CancelRequest request) {
-        Reservation reservation = reservationRepository.findById(request.getReservationId())
+        Reservation reservation = reservationRepository.findByIdForUpdate(request.getReservationId())
+                .or(() -> reservationRepository.findById(request.getReservationId()))
                 .orElseThrow(() -> new ResourceNotFoundException("Reservation not found: " + request.getReservationId()));
 
         if (!reservation.getUserId().equals(request.getUserId())) {

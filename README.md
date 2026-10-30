@@ -62,19 +62,20 @@ flowchart TD
 Standard read-modify-write patterns (`GET stock:{sku}` followed by `DECRBY stock:{sku}`) suffer from check-then-act race conditions under parallel load. To guarantee **zero overselling** before traffic ever reaches PostgreSQL:
 - Reservation requests execute [`hold_stock.lua`](src/main/resources/scripts/hold_stock.lua) inside Redis via `EVAL`.
 - Because Redis executes Lua scripts atomically on its single command thread, no two requests can interleave between the stock check (`current_stock < requested_qty`), the stock deduction (`DECRBY`), and the temporary hold creation (`SET reservation:{id} payload EX 600`).
+- If PostgreSQL persistence encounters any runtime failure after the Redis hold succeeds, `CheckoutService` immediately executes compensating [`release_stock.lua`](src/main/resources/scripts/release_stock.lua) to prevent leaked holds.
 - Rejected requests fail fast in sub-millisecond time with `HTTP 409 Conflict ("Item out of stock")` without acquiring a single database lock.
 
 ### Precision Accounting in Minor Units (`öre`)
 Floating-point representations (`float`, `double`) cannot accurately represent base-10 monetary fractions (e.g., `0.1 + 0.2 != 0.3` in IEEE 754 binary floating point), leading to rounding drift across ledger settlements.
 - Every monetary column (`inventory_items.price_minor`, `wallet_accounts.balance_minor`, `orders.total_amount_minor`) is stored as a 64-bit integer (`BIGINT` / `Long`) representing **minor currency units** (`öre` for `SEK`, where `19900` = `199.00 SEK` and `50000` = `500.00 SEK`).
-- All arithmetic (`quantity * priceMinor`, `balanceMinor - totalCost`) is exact integer math with database-level `CHECK (balance_minor >= 0)` constraints.
+- All arithmetic (`quantity * priceMinor`, `balanceMinor - totalCost`) is exact integer math enforced by database-level `CHECK (balance_minor >= 0)` constraints.
 
 ### Concurrency Control: Pessimistic (`SELECT FOR UPDATE`) vs. Optimistic (`@Version`) Locking
 The engine combines both locking strategies across the domain model based on contention profile and failure semantics:
 
 | Mechanism | Usage in Engine | SQL / JPA Mechanism | Why Chosen |
 | :--- | :--- | :--- | :--- |
-| **Pessimistic Write Lock** | `WalletAccountRepository.findByUserIdForUpdate` & `InventoryItemRepository.findBySkuForUpdate` during `/checkout` | `SELECT ... FOR UPDATE` (`@Lock(LockModeType.PESSIMISTIC_WRITE)`) | Serializes concurrent checkout attempts for the same wallet at the database row level. The second concurrent thread blocks until the first commits, then immediately observes the updated `0` balance and deterministically throws `InsufficientFundsException` (`400 Bad Request`) instead of failing with a generic optimistic retry exception. |
+| **Pessimistic Write Lock** | `ReservationRepository.findByIdForUpdate`, `WalletAccountRepository.findByUserIdForUpdate`, & `InventoryItemRepository.findBySkuForUpdate` during `/checkout`, `/cancel`, and expiration | `SELECT ... FOR UPDATE` (`@Lock(LockModeType.PESSIMISTIC_WRITE)`) | Serializes concurrent checkout attempts for the same wallet or reservation at the database row level. The second concurrent thread blocks until the first commits, then immediately observes the updated `0` balance and deterministically throws `InsufficientFundsException` (`400 Bad Request`) instead of failing with a generic optimistic retry exception. |
 | **Optimistic Locking** | `@Version` column on `InventoryItem` and `WalletAccount` entities | `UPDATE ... SET version = version + 1 WHERE id = ? AND version = ?` | Acts as a defense-in-depth invariant guard for non-locking administrative updates, preventing lost updates if two transactions ever modify an entity outside a pessimistic lock boundary. |
 
 ---
@@ -99,9 +100,92 @@ The concurrency integration test suite ([`FlashSaleConcurrencyIntegrationTest`](
 | `POST` | `/api/v1/sales/checkout` | Settles a `HELD` reservation inside an ACID transaction (`SELECT FOR UPDATE`) | `200 OK` | `400 Bad Request` (Insufficient funds / expired), `404 Not Found` |
 | `POST` | `/api/v1/sales/cancel` | Proactively cancels a `HELD` reservation and immediately refunds Redis stock | `200 OK` | `400 Bad Request`, `404 Not Found` |
 
+### Example Payloads
+
+#### 1. Reserve Stock (`POST /api/v1/sales/reserve`)
+```json
+// Request
+{
+  "sku": "FLASH-TICKET",
+  "userId": "user-1",
+  "quantity": 1
+}
+
+// Response (201 Created)
+{
+  "reservationId": "3f9a1b54-8b2d-4e92-9b18-6d2f839c7a10",
+  "sku": "FLASH-TICKET",
+  "quantity": 1,
+  "expiresAt": "2026-10-30T11:05:00Z"
+}
+```
+
+#### 2. Settle Checkout (`POST /api/v1/sales/checkout`)
+```json
+// Request
+{
+  "reservationId": "3f9a1b54-8b2d-4e92-9b18-6d2f839c7a10",
+  "userId": "user-1"
+}
+
+// Response (200 OK)
+{
+  "orderId": "c17e9042-45e0-4d3b-a855-1f90c62b4d11",
+  "status": "PAID",
+  "totalDeductedMinor": 50000,
+  "currency": "SEK"
+}
+```
+
+#### 3. Cancel Reservation (`POST /api/v1/sales/cancel`)
+```json
+// Request
+{
+  "reservationId": "3f9a1b54-8b2d-4e92-9b18-6d2f839c7a10",
+  "userId": "user-1"
+}
+
+// Response (200 OK)
+{
+  "reservationId": "3f9a1b54-8b2d-4e92-9b18-6d2f839c7a10",
+  "status": "CANCELLED"
+}
+```
+
 ---
 
-## 5. Setup & Verification
+## 5. Project Structure
+
+```text
+flash-sale-reservation-engine/
+├── docker-compose.yml
+├── pom.xml
+└── src/
+    ├── main/
+    │   ├── java/com/flashsale/reservation/
+    │   │   ├── config/RedisConfig.java
+    │   │   ├── controller/FlashSaleController.java
+    │   │   ├── domain/ (InventoryItem, Reservation, WalletAccount, Order, Status enums)
+    │   │   ├── dto/ (HoldRequest/Response, CheckoutRequest/Response, CancelRequest/Response)
+    │   │   ├── exception/ (GlobalExceptionHandler, domain exceptions)
+    │   │   ├── repository/ (JPA repositories with @Lock(PESSIMISTIC_WRITE))
+    │   │   ├── service/ (CheckoutService, RedisReservationService)
+    │   │   └── worker/ (ReservationReconciliationWorker, ReservationExpirationProcessor)
+    │   └── resources/
+    │       ├── application.yml
+    │       ├── db/migration/V1__init_flash_sale_schema.sql
+    │       └── scripts/ (hold_stock.lua, release_stock.lua)
+    └── test/
+        └── java/com/flashsale/reservation/
+            ├── FlashSaleConcurrencyIntegrationTest.java
+            ├── controller/FlashSaleControllerTest.java
+            ├── service/CheckoutServiceUnitTest.java
+            └── worker/ReservationReconciliationWorkerTest.java
+```
+
+---
+
+## 6. Setup & Verification
 
 ### Prerequisites
 - **Java 21** (Temurin / OpenJDK 21+)
@@ -122,7 +206,7 @@ Flyway automatically applies [`V1__init_flash_sale_schema.sql`](src/main/resourc
 ```
 
 ### 3. Run Unit & Concurrency Integration Tests
-Execute the full test suite (unit tests + Testcontainers multi-threaded chaos tests):
+Execute the full test suite (unit tests + MVC slice tests + Testcontainers multi-threaded chaos tests):
 
 ```bash
 ./mvnw verify

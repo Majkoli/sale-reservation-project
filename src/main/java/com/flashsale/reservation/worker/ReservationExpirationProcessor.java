@@ -1,6 +1,5 @@
 package com.flashsale.reservation.worker;
 
-import com.flashsale.reservation.domain.Reservation;
 import com.flashsale.reservation.domain.ReservationStatus;
 import com.flashsale.reservation.repository.ReservationRepository;
 import com.flashsale.reservation.service.RedisReservationService;
@@ -21,11 +20,12 @@ public class ReservationExpirationProcessor {
     private final RedisReservationService redisReservationService;
 
     /**
-     * Processes a single expired reservation in an isolated transaction.
+     * Processes a single expired reservation in an isolated transaction with pessimistic row locking.
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public boolean expireReservation(UUID reservationId) {
-        return reservationRepository.findById(reservationId)
+        return reservationRepository.findByIdForUpdate(reservationId)
+                .or(() -> reservationRepository.findById(reservationId))
                 .filter(reservation -> reservation.getStatus() == ReservationStatus.HELD)
                 .map(reservation -> {
                     reservation.setStatus(ReservationStatus.EXPIRED);
